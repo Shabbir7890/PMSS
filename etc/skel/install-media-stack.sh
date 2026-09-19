@@ -696,7 +696,7 @@ lighttpd_custom_strip_managed_media_stack_routes() {
 
 	if ! awk '
     function line_is_managed_route_start(line) {
-      return line ~ /^[[:space:]]*\$HTTP\["url"\] =~ "\^\/(sabnzbd|radarr|prowlarr|sonarr|jellyfin)[(]\\[$][|]\/[)]"/
+      return line ~ /^[[:space:]]*\$HTTP\["url"\] =~ "\^\/(sabnzbd|radarr|prowlarr|sonarr|jellyfin|autobrr)[(]\\[$][|]\/[)]"/
     }
 
     function brace_delta(line, open_count, close_count) {
@@ -1114,6 +1114,13 @@ media_stack_uninstall() {
 		media_stack_managed_path_remove "$managed_path"
 	done < <(media_stack_managed_paths)
 	bashrc_custom_media_stack_blocks_strip
+	# media-stack.conf is not the only fragment that can hold these routes. When the
+	# installer's legacy migration preserved a pre-existing ~/.lighttpd/custom it moved
+	# it to custom.d/custom-migrated.conf, which is treated as customer-owned from then
+	# on and never revisited. Any managed proxy routes it still carries survive the
+	# uninstall and keep answering 503. Strip them with the same sanitizer the migration
+	# path uses, before the reload below, so the restart reads a clean tree. (Refs #851)
+	lighttpd_custom_strip_managed_media_stack_routes "$HOME/.lighttpd/custom.d/custom-migrated.conf" || true
 	# An uninstall removes ~/.lighttpd/custom.d/media-stack.conf, but the running
 	# per-user lighttpd still holds the proxy routes it parsed at start, so every
 	# uninstalled app keeps answering 503 against a backend that is gone. The
