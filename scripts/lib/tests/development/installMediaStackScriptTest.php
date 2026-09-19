@@ -1080,7 +1080,14 @@ BASHRC
         $trace = $home.'/trace.log';
         $this->pmssEnsureDir($home.'/.bin');
 
-        $functions = $this->pmssExtractShellFunctions($this->script, array('fetch_verified_archive', 'servarr_install_from_url'));
+        $functions = $this->pmssExtractShellFunctions($this->script, array(
+            // artifact_id_resolve() is what fetch_verified_archive() now derives the
+            // checksum id with, so the harness needs it and its predicate too.
+            'artifact_id_looks_like_archive',
+            'artifact_id_resolve',
+            'fetch_verified_archive',
+            'servarr_install_from_url',
+        ));
         $script = implode("\n", array(
             '#!/usr/bin/env bash',
             'set -euo pipefail',
@@ -1096,6 +1103,10 @@ BASHRC
             'verify_checksum() { echo "verify:$1|$2" >> "$TRACE"; return 0; }',
             'extract_tgz() { echo "extract:$*" >> "$TRACE"; }',
             'servarr_config_xml_converge() { echo "config:$1|$2|$3|$4" >> "$TRACE"; }',
+            // Hermetic: artifact_id_resolve() probes the redirect chain when the URL path
+            // carries no archive name. Stub curl so nothing leaves the test, and so the id
+            // deterministically falls back to the naive basename.
+            'curl() { echo "curl:$*" >> "$TRACE"; return 1; }',
             $functions,
             'servarr_install_from_url "radarr" "Radarr" "$HOME/.config/radarr" "17878" "7878" "https://example.invalid/updatefile?os=linux"',
             '',
@@ -1113,6 +1124,39 @@ BASHRC
             'extract:Radarr.tar.gz',
             'config:radarr|'.$home.'/.config/radarr|17878|7878',
         ), $traceOutput);
+    }
+
+
+    public function testArtifactIdResolveFallsBackWhenTheUrlPathHasNoArchiveName(): void
+    {
+        // Endpoint-style Servarr URLs carry no file name: basename gives 'latest' or
+        // 'updatefile', which can never match a checksums file keyed by archive name.
+        $functions = $this->pmssExtractShellFunctions(
+            $this->script,
+            array('artifact_id_looks_like_archive', 'artifact_id_resolve')
+        );
+        $script = implode("\n", array(
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            $functions,
+            // A real archive name in the path is used as-is, with no probe at all.
+            'curl() { echo "UNEXPECTED-PROBE"; return 1; }',
+            'echo "direct:$(artifact_id_resolve https://example.invalid/jellyfin_10.11.6-amd64.tar.gz)"',
+            // No usable probe result: fall back to today's naive basename.
+            'echo "fallback:$(artifact_id_resolve "https://example.invalid/v1/update/master/updatefile?os=linux")"',
+            // A probe that reports the served file name resolves to it, which is what
+            // makes those endpoints pinnable at all.
+            'curl() { echo "https://example.invalid/Radarr.master.5.10.4.9218.linux-core-x64.tar.gz"; return 0; }',
+            'echo "resolved:$(artifact_id_resolve "https://example.invalid/v1/update/master/updatefile?os=linux")"',
+            '',
+        ));
+
+        $output = $this->pmssRunShellHarness($script);
+
+        $this->assertStringContainsString('direct:jellyfin_10.11.6-amd64.tar.gz', $output);
+        $this->assertStringContainsString('fallback:updatefile', $output);
+        $this->assertStringContainsString('resolved:Radarr.master.5.10.4.9218.linux-core-x64.tar.gz', $output);
+        $this->assertStringNotContainsString('UNEXPECTED-PROBE', $output);
     }
 
 }

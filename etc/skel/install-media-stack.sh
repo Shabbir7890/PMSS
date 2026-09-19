@@ -291,11 +291,61 @@ fetch_checksums_file() {
 	fi
 }
 
+# Artifacts that installed WITHOUT hash verification, reported once at the end of
+# the run so the gap is visible instead of a warn buried mid-log.
+UNVERIFIED_ARTIFACTS=()
+# Opt-in fail-closed mode for fleet / CI installs: treat every artifact as if it
+# had been passed require=1. Default (0) keeps today's warn-and-proceed behaviour,
+# so an unpinned new upstream release still installs for an interactive customer.
+STRICT_CHECKSUM="${MEDIA_STACK_STRICT_CHECKSUM:-0}"
+
+artifact_id_looks_like_archive() {
+	case "$1" in
+	*.tar.gz | *.tgz | *.tar.xz | *.tar.bz2 | *.zip) return 0 ;;
+	esac
+	return 1
+}
+
+# Resolve the artifact id used to look a pin up in the checksums file.
+# Endpoint-style URLs carry no file name in their path:
+#   https://services.sonarr.tv/v1/download/main/latest?version=4&os=linux&arch=x64
+#   https://radarr.servarr.com/v1/update/master/updatefile?os=linux&runtime=netcore&arch=x64
+# basename() on those yields 'latest' / 'updatefile' -- ids that can never match a
+# pin, so every Servarr install takes the warn-and-proceed branch no matter what the
+# checksums file holds. Follow the redirect chain and use the file name the server
+# actually serves; fall back to the naive basename when the HEAD request is
+# unavailable or inconclusive, which is exactly today's behaviour.
+artifact_id_resolve() {
+	local url="$1" naive effective
+	naive=$(basename "${url%%\?*}")
+	if artifact_id_looks_like_archive "$naive"; then
+		printf '%s
+' "$naive"
+		return 0
+	fi
+	if command -v curl >/dev/null 2>&1; then
+		effective=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$url" 2>/dev/null || true)
+		if [[ -n "$effective" ]]; then
+			effective=$(basename "${effective%%\?*}")
+			if artifact_id_looks_like_archive "$effective"; then
+				printf '%s
+' "$effective"
+				return 0
+			fi
+		fi
+	fi
+	printf '%s
+' "$naive"
+}
+
 # Verify SHA256 checksum of a downloaded file against the checksums file.
 # - artifact_id not found in checksums file: warn, return 0 (allow new versions)
 # - artifact_id found but hash mismatches: error, return 1 (corruption/compromise)
 verify_checksum() {
 	local file="$1" artifact_id="$2" require="${3:-0}"
+	# Fleet/CI switch: every artifact must be pinned, not just the ones a call site
+	# marks. Leaves the per-call require=1 contract untouched.
+	[[ "$STRICT_CHECKSUM" == "1" ]] && require=1
 	if [[ ! -f "$file" ]]; then
 		return 0 # File not present (e.g., dry-run mode) — skip
 	fi
@@ -305,6 +355,7 @@ verify_checksum() {
 			return 1
 		fi
 		log_warn "No checksums file — skipping verification for $(basename "$file")"
+		UNVERIFIED_ARTIFACTS+=("${artifact_id} (no checksums file)")
 		return 0
 	fi
 	local expected_hash
@@ -316,6 +367,7 @@ verify_checksum() {
 			return 1
 		fi
 		log_warn "No checksum on file for '${artifact_id}' — skipping verification"
+		UNVERIFIED_ARTIFACTS+=("${artifact_id}")
 		return 0
 	fi
 	local actual_hash
@@ -400,7 +452,7 @@ fetch() {
 
 fetch_verified_archive() {
 	local url="$1" archive="$2" label="$3" checksum_id="${4:-}" require_checksum="${5:-0}"
-	[[ -n "$checksum_id" ]] || checksum_id=$(basename "${url%%\?*}")
+	[[ -n "$checksum_id" ]] || checksum_id=$(artifact_id_resolve "$url")
 
 	if ! fetch "$url" "$archive"; then
 		log_err "Failed to download ${label}"
@@ -2486,6 +2538,11 @@ summary_jellyfin_config=""
 echo "Port summary: SABnzbd=${SABNZBD_PORT}, Radarr=${RADARR_PORT}, Sonarr=${SONARR_PORT}, Prowlarr=${PROWLARR_PORT}, Autobrr=${AUTOBRR_PORT}${summary_jellyfin_port}"
 echo "Config dirs: SABnzbd=$HOME/.config/sabnzbd | Radarr=$HOME/.config/radarr | Sonarr=$HOME/.config/sonarr | Prowlarr=$HOME/.config/prowlarr | Autobrr=$HOME/.config/autobrr${summary_jellyfin_config} | Cloudplow=$HOME/.config/cloudplow"
 echo "Tmux sessions running: $(media_stack_sessions_label)"
+
+if [[ ${#UNVERIFIED_ARTIFACTS[@]} -gt 0 ]]; then
+	echo "Integrity: ${#UNVERIFIED_ARTIFACTS[@]} artifact(s) installed WITHOUT hash verification: ${UNVERIFIED_ARTIFACTS[*]}"
+	echo "Integrity: pin them in etc/skel/.install-checksums.sha256, or re-run with MEDIA_STACK_STRICT_CHECKSUM=1 to fail closed."
+fi
 
 echo ""
 echo "To kill all applications use 'tmux kill-server'"
